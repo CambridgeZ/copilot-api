@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test"
 
-import type { ResponsesResult } from "../src/services/copilot/create-responses"
+import type {
+  ResponsesPayload,
+  ResponsesResult,
+} from "../src/services/copilot/create-responses"
 
 type ListenerEvent = {
   data?: string
@@ -241,6 +244,30 @@ test("Responses websocket pool reuses the same connection for matching pool keys
 
   expect(MockWebSocket.instances).toHaveLength(1)
   expect(MockWebSocket.instances[0]?.sent).toHaveLength(2)
+})
+
+test("Responses websocket bypasses the pool when replaying encrypted content", async () => {
+  await collectResponsesStream("request-1", encryptedContentInput())
+  await collectResponsesStream("request-1", encryptedContentInput())
+
+  // Each encrypted-content request must land on its own dedicated connection so
+  // a concurrent client cannot corrupt the stateful reasoning context.
+  expect(MockWebSocket.instances).toHaveLength(2)
+  expect(MockWebSocket.instances[0]?.sent).toHaveLength(1)
+  expect(MockWebSocket.instances[1]?.sent).toHaveLength(1)
+})
+
+test("Responses websocket encrypted-content request does not reuse a pooled connection", async () => {
+  // Warm the pool with a plain request that would otherwise be reused.
+  await collectResponsesStream("request-1")
+  expect(MockWebSocket.instances).toHaveLength(1)
+
+  // A follow-up encrypted-content request with the SAME pool key must still
+  // open a fresh, dedicated connection rather than reusing the pooled one.
+  await collectResponsesStream("request-1", encryptedContentInput())
+
+  expect(MockWebSocket.instances).toHaveLength(2)
+  expect(MockWebSocket.instances[1]?.sent).toHaveLength(1)
 })
 
 test("Responses websocket open failure includes the underlying reason", async () => {
@@ -608,10 +635,13 @@ test("Responses websocket honors NO_PROXY when resolving Bun websocket proxy", a
   }
 })
 
-const collectResponsesStream = async (requestId: string): Promise<void> => {
+const collectResponsesStream = async (
+  requestId: string,
+  input: ResponsesPayload["input"] = "hello",
+): Promise<void> => {
   const response = await createResponses(
     {
-      input: "hello",
+      input,
       model: "gpt-test",
       stream: true,
     },
@@ -627,6 +657,15 @@ const collectResponsesStream = async (requestId: string): Promise<void> => {
     // consume stream
   }
 }
+
+const encryptedContentInput = (): ResponsesPayload["input"] => [
+  { role: "user", content: "hello" },
+  {
+    type: "reasoning",
+    summary: [],
+    encrypted_content: "gAAAencrypted",
+  },
+]
 
 const collectStreamChunks = async (
   stream: AsyncIterable<unknown>,

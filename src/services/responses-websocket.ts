@@ -7,6 +7,11 @@ export interface PooledWebSocketRequest<TPayload> {
   payload: TPayload
   poolKey: string
   url: string
+  // When true, force a dedicated connection that is never shared via the pool.
+  // Used for stateful requests (e.g. replaying encrypted reasoning/compaction
+  // content) whose server-side context must not be corrupted by a concurrent
+  // request landing on the same pooled websocket.
+  bypassPool?: boolean
 }
 
 export interface PooledWebSocketStreamOptions<TChunk> {
@@ -101,7 +106,10 @@ const getPooledWebSocketRequestTarget = <TPayload, TChunk>(
   request: PooledWebSocketRequest<TPayload>,
   options: PooledWebSocketStreamOptions<TChunk>,
 ): PooledWebSocketRequestTarget => {
-  if (getPooledWebSocketActiveRequestCount(request.poolKey) > 0) {
+  if (
+    request.bypassPool
+    || getPooledWebSocketActiveRequestCount(request.poolKey) > 0
+  ) {
     return {
       entry: createPooledWebSocketEntry(request, options),
       pooled: false,

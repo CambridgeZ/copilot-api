@@ -18,6 +18,7 @@ import {
   buildResponsesWebSocketPayload,
   buildResponsesWebSocketUrl,
   createResponses,
+  payloadReplaysEncryptedContent,
   prepareResponsesWebSocketRequest,
 } from "../src/services/copilot/create-responses"
 
@@ -345,5 +346,90 @@ describe("createResponses", () => {
     expect(new Set([mainKey, subagentKey, otherModelKey]).size).toBe(3)
     expect(mainKey).toContain("gpt-test")
     expect(mainKey).toContain("request-1")
+  })
+
+  test("detects payloads that replay encrypted reasoning content", () => {
+    expect(
+      payloadReplaysEncryptedContent({
+        input: [
+          { role: "user", content: "hello" },
+          {
+            type: "reasoning",
+            summary: [],
+            encrypted_content: "gAAAencrypted",
+          },
+        ],
+        model: "gpt-test",
+      }),
+    ).toBe(true)
+  })
+
+  test("detects payloads that replay encrypted compaction content", () => {
+    expect(
+      payloadReplaysEncryptedContent({
+        input: [
+          {
+            id: "cmp-1",
+            type: "compaction",
+            encrypted_content: "gAAAcompaction",
+          },
+        ],
+        model: "gpt-test",
+      }),
+    ).toBe(true)
+  })
+
+  test("does not flag payloads without encrypted content", () => {
+    expect(
+      payloadReplaysEncryptedContent({
+        input: [{ role: "user", content: "hello" }],
+        model: "gpt-test",
+      }),
+    ).toBe(false)
+    expect(
+      payloadReplaysEncryptedContent({ input: "hello", model: "gpt-test" }),
+    ).toBe(false)
+    expect(
+      payloadReplaysEncryptedContent({
+        input: [{ type: "reasoning", summary: [], encrypted_content: "" }],
+        model: "gpt-test",
+      }),
+    ).toBe(false)
+  })
+
+  test("websocket request bypasses the pool when replaying encrypted content", () => {
+    const preparedHeaders = {
+      ...copilotHeaders(state, "request-1", false),
+      "x-initiator": "user",
+    }
+
+    const withEncrypted = prepareResponsesWebSocketRequest(
+      {
+        input: [
+          { role: "user", content: "hello" },
+          {
+            type: "reasoning",
+            summary: [],
+            encrypted_content: "gAAAencrypted",
+          },
+        ],
+        model: "gpt-test",
+        stream: true,
+      },
+      preparedHeaders,
+      { requestId: "request-1" },
+    )
+    expect(withEncrypted.bypassPool).toBe(true)
+
+    const withoutEncrypted = prepareResponsesWebSocketRequest(
+      {
+        input: [{ role: "user", content: "hello" }],
+        model: "gpt-test",
+        stream: true,
+      },
+      preparedHeaders,
+      { requestId: "request-1" },
+    )
+    expect(withoutEncrypted.bypassPool).toBe(false)
   })
 })

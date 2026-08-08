@@ -685,7 +685,40 @@ export const prepareResponsesWebSocketRequest = (
     poolKey: buildResponsesWebSocketPoolKey(payload, options),
     payload: buildResponsesWebSocketPayload(payload, initiator),
     url: buildResponsesWebSocketUrl(copilotBaseUrl(state)),
+    bypassPool: payloadReplaysEncryptedContent(payload),
   }
+}
+
+// A Copilot responses websocket is stateful: the server tracks the reasoning
+// context of the last response sent on that connection, and encrypted content
+// can only be decrypted in the context that produced it. When a payload
+// replays encrypted reasoning/compaction content, it must run on a dedicated
+// connection so a concurrent client cannot mutate the shared context mid-stream
+// and cause "encrypted content could not be verified" errors.
+export const payloadReplaysEncryptedContent = (
+  payload: ResponsesPayload,
+): boolean => {
+  const input = payload.input
+  if (!Array.isArray(input)) {
+    return false
+  }
+
+  return input.some((item) => itemHasEncryptedContent(item))
+}
+
+const itemHasEncryptedContent = (item: ResponseInputItem): boolean => {
+  if (!item || typeof item !== "object") {
+    return false
+  }
+
+  const type = (item as { type?: unknown }).type
+  if (type !== "reasoning" && type !== "compaction") {
+    return false
+  }
+
+  const encryptedContent = (item as { encrypted_content?: unknown })
+    .encrypted_content
+  return typeof encryptedContent === "string" && encryptedContent.length > 0
 }
 
 export const buildResponsesWebSocketPoolKey = (

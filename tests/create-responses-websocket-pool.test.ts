@@ -605,7 +605,7 @@ test("Responses websocket stream failure includes the underlying reason", async 
   expect(chunks).toHaveLength(1)
   expect(chunks[0]?.event).toBe("error")
   expect(chunks[0]?.data).toContain(
-    '"message":"Responses websocket stream error: socket hang up"',
+    '"message":"Upstream connection lost, Responses websocket stream error: socket hang up"',
   )
 })
 
@@ -636,7 +636,7 @@ test("Responses websocket emits an error event when the websocket closes without
   expect(chunks).toHaveLength(1)
   expect(chunks[0]?.event).toBe("error")
   expect(chunks[0]?.data).toContain(
-    '"message":"Responses websocket ended without a terminal response"',
+    '"message":"Responses websocket ended without a terminal response, retry your request."',
   )
 })
 
@@ -881,14 +881,14 @@ const enableRecoveryModel = (
 const recoveryRequest = async (
   sessionId: string,
   requestId: string,
-  signal?: AbortSignal,
+  clientSignal?: AbortSignal,
 ): Promise<ResponsesStream> =>
   (await createResponses(
     { model: "gpt-test", stream: true, input: `message-${requestId}` },
     {
       sessionId,
       requestId,
-      signal,
+      clientSignal,
       initiator: "user",
       vision: false,
       transport: "websocket",
@@ -1077,7 +1077,7 @@ test("a model without HTTP Responses reconnects with a fresh websocket", async (
   expect(http).not.toHaveBeenCalled()
 })
 
-test("user cancellation does not switch subsequent messages to HTTP", async () => {
+test("client cancellation drains the response without switching subsequent messages to HTTP", async () => {
   enableRecoveryModel()
   MockWebSocket.autoComplete = false
   const http = mockRecoveryHttp()
@@ -1087,10 +1087,12 @@ test("user cancellation does not switch subsequent messages to HTTP", async () =
   )
   await waitFor(() => MockWebSocket.instances[0]?.sent.length === 1)
   controller.abort()
-  expect(await first).toHaveLength(0)
+  expect(MockWebSocket.instances[0]?.readyState).toBe(MockWebSocket.OPEN)
+  MockWebSocket.instances[0]?.completeLatestResponse()
+  expect((await first).at(-1)?.event).toBe("response.completed")
   MockWebSocket.autoComplete = true
   await collectStreamChunks(await recoveryRequest("cancel-recovery", "same"))
-  expect(MockWebSocket.instances).toHaveLength(2)
+  expect(MockWebSocket.instances).toHaveLength(1)
   expect(http).not.toHaveBeenCalled()
 })
 

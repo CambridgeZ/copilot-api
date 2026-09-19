@@ -34,6 +34,13 @@ import type {
 } from "~/lib/types/responses"
 
 export const MESSAGES_COMPACTION_PREFIX = "copilot-api:messages-compaction:v1:"
+const MESSAGES_REASONING_ID_SUFFIX = "__a1"
+
+export const markMessagesReasoningId = (id: string): string =>
+  `${id}${MESSAGES_REASONING_ID_SUFFIX}`
+
+export const isMessagesReasoningId = (id: unknown): boolean =>
+  typeof id === "string" && id.endsWith(MESSAGES_REASONING_ID_SUFFIX)
 
 export const MESSAGES_COMPACTION_PROMPT = [
   "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.",
@@ -48,6 +55,18 @@ export const MESSAGES_COMPACTION_PROMPT = [
   "Be concise, structured, and focused on helping the next LLM seamlessly continue the work.",
   "",
   compactTextOnlyGuard,
+].join("\n")
+
+export const MESSAGES_TOOL_CALL_TIPS = [
+  "# Tool Call Tips",
+  "- Do NOT call `exec_command` directly; that tool does not exist. Use `functions__exec` to run commands instead.",
+  '- The functions__exec tool accepts parameters only as {"input":"..."}; put the complete executable code inside input, including properly constructed tools.exec_command(...) calls and text(...) output handling.',
+  "- Construct all tools.exec_command(...) arguments strictly according to its tool definition, and use OS/shell-compatible commands for Windows, Linux, and macOS.",
+  "- Always assign the awaited tools.exec_command(...) call to a variable and forward the full result with text(JSON.stringify(r)); unforwarded output is silently dropped and makes results look empty.",
+  "- Yielded execution is not truncated output. Resume a running `cell_id` with `functions.wait`, and a live `session_id` with `tools.write_stdin`, until the command reaches a terminal result.",
+  "- Read files with the OS-native command (Get-Content/Test-Path on Windows PowerShell, cat/ls on POSIX), quote paths containing spaces, and verify the forwarded output is non-empty before concluding a file was read.",
+  "- For long-running commands, keep the returned `session_id` and poll it with `tools.write_stdin` until the command finishes; do not redirect output to a temp file and read it back in a second call.",
+  "- If `functions__exec` returns `aborted`, retry at most 3 times. After 3 failures, terminate immediately and inform the user that `functions__exec` is unavailable.",
 ].join("\n")
 
 const COMPACTION_REPLAY_PROMPT =
@@ -112,7 +131,7 @@ interface ResponsesInputNormalization {
 
 export function translateResponsesToMessages(
   payload: ResponsesPayload,
-  options: { model: string; publicModel?: string },
+  options: { model: string; publicModel?: string; toolCallTips?: boolean },
 ): ResponsesToMessagesTranslation {
   const registry = createToolRegistry(payload)
   const normalized = normalizeResponsesInput(payload.input)
@@ -121,6 +140,7 @@ export function translateResponsesToMessages(
     registry,
     payload.instructions,
     payload.input,
+    options.toolCallTips ?? false,
   )
 
   if (normalized.compaction) {
@@ -439,21 +459,11 @@ function registerMessagesTool(
   const existing = registry.byOriginal.get(originalKey)
   if (existing) return existing
 
-  const preferredName =
-    registration.namespace ?
-      `${registration.namespace.replaceAll(".", "_")}__${registration.name}`
-    : registration.name
-  const alias = createToolAlias(preferredName, originalKey, registry)
-  const descriptor: MessagesToolDescriptor = {
-    alias,
-    kind: registration.kind,
-    name: registration.name,
-    ...(registration.namespace ? { namespace: registration.namespace } : {}),
-  }
-  registry.byAlias.set(alias, descriptor)
+  const descriptor = createMessagesToolDescriptor(registration, registry)
+  registry.byAlias.set(descriptor.alias, descriptor)
   registry.byOriginal.set(originalKey, descriptor)
   registry.tools.push({
-    name: alias,
+    name: descriptor.alias,
     ...(registration.description ?
       { description: registration.description }
     : {}),
@@ -466,11 +476,30 @@ function registerMessagesTool(
   return descriptor
 }
 
+function createMessagesToolDescriptor(
+  registration: Pick<ToolRegistration, "kind" | "name" | "namespace">,
+  registry: MessagesToolRegistry,
+): MessagesToolDescriptor {
+  const originalKey = createOriginalToolKey(registration)
+  const preferredName =
+    registration.namespace ?
+      `${registration.namespace.replaceAll(".", "_")}__${registration.name}`
+    : registration.name
+  const alias = createToolAlias(preferredName, originalKey, registry)
+  return {
+    alias,
+    kind: registration.kind,
+    name: registration.name,
+    ...(registration.namespace ? { namespace: registration.namespace } : {}),
+  }
+}
+
 function translateInputToAnthropic(
   input: string | Array<ResponseInputItem> | undefined,
   registry: MessagesToolRegistry,
   instructions: string | null | undefined,
   originalInput: ResponsesPayload["input"],
+  toolCallTips: boolean,
 ): {
   messages: Array<AnthropicInputMessage>
   system: Array<AnthropicTextBlock>
@@ -484,10 +513,30 @@ function translateInputToAnthropic(
 
   if (typeof input === "string") {
     messages.push({ role: "user", content: input })
-    return { messages, system }
+  } else if (Array.isArray(input)) {
+    translateInputItems(input, messages, system, registry)
   }
-  if (!Array.isArray(input)) return { messages, system }
+  if (toolCallTips) {
+    appendToolCallTips(system)
+  }
+  return { messages, system }
+}
 
+function appendToolCallTips(system: Array<AnthropicTextBlock>): void {
+  const lastSystemBlock = system.at(-1)
+  if (!lastSystemBlock) {
+    system.push({ type: "text", text: MESSAGES_TOOL_CALL_TIPS })
+    return
+  }
+  lastSystemBlock.text = `${lastSystemBlock.text}\n\n${MESSAGES_TOOL_CALL_TIPS}`
+}
+
+function translateInputItems(
+  input: Array<ResponseInputItem>,
+  messages: Array<AnthropicInputMessage>,
+  system: Array<AnthropicTextBlock>,
+  registry: MessagesToolRegistry,
+): void {
   let userMessageSeen = false
   for (const item of input) {
     const type = getItemType(item)
@@ -540,7 +589,6 @@ function translateInputToAnthropic(
       }
     }
   }
-  return { messages, system }
 }
 
 function translateInputMessage(
@@ -638,7 +686,7 @@ function translateInputReasoning(
     : ""
   appendAssistantBlock(messages, {
     type: "thinking",
-    thinking: thinking || "Thinking...",
+    thinking: thinking || "",
     signature: item.encrypted_content ?? "",
   })
 }
@@ -656,7 +704,11 @@ function translateInputToolCall(
   }
   const name = requireStringField(item, "name", `${kind}_tool_call`)
   const namespace = getOptionalStringField(item, "namespace") ?? undefined
-  const descriptor = registerMessagesTool({ kind, name, namespace }, registry)
+  const toolIdentity = { kind, name, namespace }
+  // Historical calls preserve conversation state; they do not define tools.
+  const descriptor =
+    registry.byOriginal.get(createOriginalToolKey(toolIdentity))
+    ?? createMessagesToolDescriptor(toolIdentity, registry)
   const input =
     kind === "custom" ?
       { input: getStringField(item, "input") ?? "" }
@@ -898,7 +950,9 @@ function translateAssistantOutput(
   for (const [index, block] of response.content.entries()) {
     if (block.type === "thinking") {
       output.push({
-        id: `rs_${createStableHash(`${response.id}:${index}:reasoning`)}`,
+        id: markMessagesReasoningId(
+          `rs_${createStableHash(`${response.id}:${index}:reasoning`)}`,
+        ),
         type: "reasoning",
         status: "completed",
         ...(block.thinking && block.thinking !== "Thinking..." ?
@@ -940,7 +994,6 @@ function translateToolUseOutput(
 ): ResponseOutputFunctionCall | ResponseOutputCustomToolCall {
   const descriptor = resolveToolDescriptor(registry, block.name)
   const common = {
-    id: `fc_${createStableHash(idSeed)}`,
     call_id: block.id,
     name: descriptor.name,
     status: "completed" as const,
@@ -949,12 +1002,14 @@ function translateToolUseOutput(
   if (descriptor.kind === "custom") {
     return {
       ...common,
+      id: `ctc_${createStableHash(idSeed)}`,
       type: "custom_tool_call",
       input: decodeCustomToolInput(block.input),
     }
   }
   return {
     ...common,
+    id: `fc_${createStableHash(idSeed)}`,
     type: "function_call",
     arguments: JSON.stringify(block.input),
   }
@@ -1036,7 +1091,7 @@ function resolveMetadataUserId(payload: ResponsesPayload): string | undefined {
 const EPHEMERAL_CACHE_CONTROL: AnthropicCacheControl = { type: "ephemeral" }
 
 // Mark the stable prompt prefix for Anthropic prompt caching: the last system
-// block plus the tail block of the final message.
+// block plus the tail block of the final user message.
 function applyEphemeralCacheControl(
   messages: Array<AnthropicInputMessage>,
   system: Array<AnthropicTextBlock>,
@@ -1046,21 +1101,23 @@ function applyEphemeralCacheControl(
     lastSystemBlock.cache_control = { ...EPHEMERAL_CACHE_CONTROL }
   }
 
-  const lastMessage = messages.at(-1)
-  if (!lastMessage) return
+  const lastUserMessage = messages.findLast(
+    (message): message is AnthropicUserMessage => message.role === "user",
+  )
+  if (!lastUserMessage) return
 
-  if (typeof lastMessage.content === "string") {
+  if (typeof lastUserMessage.content === "string") {
     const textBlock: AnthropicTextBlock = {
       type: "text",
-      text: lastMessage.content,
+      text: lastUserMessage.content,
       cache_control: { ...EPHEMERAL_CACHE_CONTROL },
     }
-    lastMessage.content = [textBlock]
+    lastUserMessage.content = [textBlock]
     return
   }
 
-  const lastBlock = lastMessage.content.at(-1)
-  if (!lastBlock || lastBlock.type === "thinking") return
+  const lastBlock = lastUserMessage.content.at(-1)
+  if (!lastBlock) return
   lastBlock.cache_control = { ...EPHEMERAL_CACHE_CONTROL }
 }
 
@@ -1095,17 +1152,15 @@ function appendUserBlock(
 
 function parseFunctionArguments(
   value: string,
-  path: string,
+  _path: string,
 ): Record<string, unknown> {
   try {
     const parsed = JSON.parse(value) as unknown
     if (isRecord(parsed)) return parsed
   } catch {
-    // The request error below contains the stable public message.
+    return {}
   }
-  throw new ResponsesMessagesTranslationError(
-    `${path} must be a JSON object string`,
-  )
+  return {}
 }
 
 function parseDataUrl(

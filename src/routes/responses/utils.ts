@@ -18,11 +18,38 @@ import {
   isGpt56OrAbove,
   isResponsesApiWebSocketEnabled as isConfiguredResponsesApiWebSocketEnabled,
 } from "~/lib/config"
+import {
+  resolveSupportedReasoningEffort,
+  type ResponsesReasoningEffort,
+} from "~/lib/reasoning-effort"
+
+import { isMessagesReasoningId } from "./messages-translation"
 
 export const RESPONSES_ENDPOINT = "/responses"
 export const RESPONSES_WS_ENDPOINT = "ws:/responses"
 export const DEFAULT_RESPONSES_COMPACT_THRESHOLD_RATIO = 0.85
 export type ResponsesApiContextManagementSource = "messages" | "responses"
+
+export const normalizeResponsesReasoningEffort = (
+  payload: ResponsesPayload,
+  supportedEfforts: Array<string> | undefined,
+): { from: string; to: ResponsesReasoningEffort } | undefined => {
+  if (!payload.reasoning || typeof payload.reasoning.effort !== "string") {
+    return undefined
+  }
+
+  const resolvedEffort = resolveSupportedReasoningEffort(
+    payload.reasoning.effort,
+    supportedEfforts,
+  )
+  if (!resolvedEffort || resolvedEffort === payload.reasoning.effort) {
+    return undefined
+  }
+
+  const requestedEffort = payload.reasoning.effort
+  payload.reasoning.effort = resolvedEffort
+  return { from: requestedEffort, to: resolvedEffort }
+}
 
 export const responsesUtilsDependencies = {
   getModelResponsesApiCompactThreshold:
@@ -359,6 +386,18 @@ const createCompactionContextManagement = (
     compact_threshold: compactThreshold,
   },
 ]
+
+export const filterReasoningForTransport = (
+  payload: ResponsesPayload,
+  useMessagesFallback: boolean,
+): void => {
+  if (!Array.isArray(payload.input)) return
+
+  payload.input = payload.input.filter((item) => {
+    if (item.type !== "reasoning") return true
+    return isMessagesReasoningId(item.id) === useMessagesFallback
+  })
+}
 
 export const applyResponsesApiContextManagement = (
   payload: ResponsesPayload,

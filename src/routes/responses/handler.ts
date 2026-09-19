@@ -80,7 +80,12 @@ export const handleResponses = async (c: Context) => {
     debugJson(logger, "Detected Codex subagent headers:", subagentMarker)
   }
 
-  const incomingSessionId = getIncomingResponsesSessionId(c)
+  // Prefer a stable client identity before deriving a fallback from message
+  // content, so a new message can find the session's transport recovery state.
+  const incomingSessionId =
+    getIncomingResponsesSessionId(c)
+    ?? getTrimmedHeader(c, "x-session-affinity")
+    ?? getTrimmedHeader(c, "x-client-request-id")
   const sessionId = incomingSessionId ? getUUID(incomingSessionId) : undefined
   const requestId = generateRequestIdFromPayload(
     { messages: payload.input },

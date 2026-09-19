@@ -18,6 +18,7 @@
     "../src/lib/deviceid.ts",
     "../src/lib/error.ts",
     "../src/lib/model-policy.ts",
+    "../src/lib/models.ts",
     "../src/lib/oauth/**/*.ts",
     "../src/lib/opencode.ts",
     "../src/lib/paths.ts",
@@ -41,6 +42,7 @@
     "../src/services/get-vscode-version.ts",
     "../src/services/github/**/*.ts",
     "../src/services/responses-http.ts",
+    "../src/services/responses-transport-recovery.ts",
     "../src/services/responses-websocket-helpers.ts",
     "../src/services/responses-websocket.ts",
     "../src/lib/electron-fetch.ts"

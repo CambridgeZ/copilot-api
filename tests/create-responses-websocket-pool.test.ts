@@ -908,6 +908,91 @@ const mockRecoveryHttp = () => {
   return fetchMock
 }
 
+test.each([
+  "x-session-affinity",
+  "x-client-request-id",
+  "session-id",
+  "x-session-id",
+])(
+  "Responses route recovers across messages using %s",
+  async (sessionHeader) => {
+    const originalDbPath = process.env.COPILOT_API_SQLITE_DB_PATH
+    process.env.COPILOT_API_SQLITE_DB_PATH = ":memory:"
+    const { Hono } = await import("hono")
+    const { traceIdMiddleware } = await import("~/lib/trace")
+    const { handleResponses } = await import("~/routes/responses/handler")
+    const { closeUsageStore } = await import("~/lib/token-usage")
+    await closeUsageStore()
+    enableRecoveryModel()
+    MockWebSocket.autoComplete = false
+    const http = mockRecoveryHttp()
+    const app = new Hono()
+    app.use("*", traceIdMiddleware)
+    app.post("/v1/responses", handleResponses)
+
+    const send = async (
+      message: string,
+      session = `route-${sessionHeader}`,
+    ) => {
+      const headers = new Headers({ "content-type": "application/json" })
+      // Lower-priority identifiers change on every message, so choosing one
+      // instead of the explicit session would break recovery.
+      if (sessionHeader === "session-id" || sessionHeader === "x-session-id") {
+        headers.set("x-session-affinity", `affinity-${message}`)
+      }
+      if (sessionHeader !== "x-client-request-id") {
+        headers.set("x-client-request-id", `request-${message}`)
+      }
+      if (sessionHeader === "session-id") {
+        headers.set("x-session-id", `alternate-${message}`)
+      }
+      headers.set(sessionHeader, session)
+      return app.request("/v1/responses", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "gpt-test",
+          stream: true,
+          input: `${sessionHeader}: ${message}`,
+        }),
+      })
+    }
+
+    try {
+      const first = send("first message").then((response) => response.text())
+      await waitFor(() => MockWebSocket.instances[0]?.sent.length === 1)
+      MockWebSocket.instances[0]?.emitError({
+        error: new Error("connection reset"),
+      })
+      expect(await first).toContain("event: error")
+      expect(http).not.toHaveBeenCalled()
+
+      MockWebSocket.autoComplete = true
+      const recovered = await (await send("second message")).text()
+      expect(recovered).toContain("event: response.completed")
+      expect(recovered).toContain("http-recovered")
+      expect(http).toHaveBeenCalledTimes(1)
+      expect(http.mock.calls[0]?.[1]?.body).toContain("second message")
+      expect(MockWebSocket.instances).toHaveLength(1)
+
+      // Reuse the other headers and message but change the actual session.
+      const unrelated = await (
+        await send("second message", `other-${sessionHeader}`)
+      ).text()
+      expect(unrelated).toContain("event: response.completed")
+      expect(MockWebSocket.instances).toHaveLength(2)
+      expect(http).toHaveBeenCalledTimes(1)
+    } finally {
+      await closeUsageStore()
+      if (originalDbPath === undefined) {
+        delete process.env.COPILOT_API_SQLITE_DB_PATH
+      } else {
+        process.env.COPILOT_API_SQLITE_DB_PATH = originalDbPath
+      }
+    }
+  },
+)
+
 test("a dropped stream recovers on the next message in the same session without replaying partial output", async () => {
   enableRecoveryModel()
   MockWebSocket.autoComplete = false
